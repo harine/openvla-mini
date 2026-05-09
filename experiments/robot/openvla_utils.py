@@ -78,39 +78,29 @@ def get_rewards(instruction, image_path, actions, cfg):
 
 def get_batch_actions(instruction: str, image_path: str, batch_size: int = 4, temperature: float = 1.0, cfg = None):
     """
-    Get multiple predictions by making individual requests to the processing server.
+    Get `batch_size` stochastic predictions in a SINGLE batched request to the
+    sglang action server. The server runs them as a real batched forward pass
+    (image_qa.run_batch), which is dramatically faster than looping one-by-one.
     """
-    # Verify image exists
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found at {image_path}")
-    
+
     payload = {
-        "instruction": instruction,
+        "instructions": [instruction] * batch_size,
         "image_path": image_path,
-        "batch_size": 1,  # Always set to 1 for individual requests
-        "temperature": temperature
+        "temperature": temperature,
     }
-    
-    all_output_ids = []
-    all_actions = []
-    
-    # Make batch_size number of individual requests
-    for _ in range(batch_size):
-        # Send request to server
-        response = requests.post(
-            f"http://127.0.0.1:{cfg.action_server_port}/batch",
-            data=json.dumps(payload),
-            headers={'Content-Type': 'application/json'}
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"Error from server: {response.text}")
-        
-        response_data = json.loads(response.text)
-        all_output_ids.extend(response_data["output_ids"])
-        all_actions.extend(response_data["actions"])
-    
-    return np.array(all_output_ids), np.array(all_actions)
+
+    response = requests.post(
+        f"http://127.0.0.1:{cfg.action_server_port}/batch",
+        data=json.dumps(payload),
+        headers={'Content-Type': 'application/json'},
+    )
+    if response.status_code != 200:
+        raise Exception(f"Error from server: {response.text}")
+
+    response_data = response.json()
+    return np.array(response_data["output_ids"]), np.array(response_data["actions"])
 
 def generate_augmented_samples_from_batch(batch_actions, num_samples=32):
     """

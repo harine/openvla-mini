@@ -1,0 +1,6 @@
+data/
+transfer_images/
+**/__pycache__/
+*.egg-info/
+*.zarr/
+*.mp4
