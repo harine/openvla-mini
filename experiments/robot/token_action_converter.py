@@ -1,4 +1,4 @@
-from transformers import AutoConfig
+import json
 import numpy as np
 
 class TokenActionConverter:
@@ -7,9 +7,14 @@ class TokenActionConverter:
         self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
         self.vocab_size = 32000
         self.unnorm_key = unnorm_key
-        self.config = AutoConfig.from_pretrained(
-            "openvla/openvla-7b", trust_remote_code=True
-        ).to_dict()
+        # Read norm_stats straight from openvla-7b's config.json. We avoid
+        # AutoConfig.from_pretrained because transformers 4.31 (the verifier env
+        # used for the in-process path) crashes repr-ing the OpenVLA config
+        # (nested LlamaConfig is not JSON-serializable). Reading the JSON
+        # directly is transformers-version-independent and identical across envs.
+        from huggingface_hub import hf_hub_download
+        with open(hf_hub_download("openvla/openvla-7b", "config.json")) as f:
+            self.config = json.load(f)
         self.norm_stats = self.config["norm_stats"]
         assert unnorm_key is not None
         if unnorm_key not in self.norm_stats:

@@ -98,6 +98,10 @@ class GenerateConfig:
     augmented_samples: int = 32
     action_server_port: int = 3200
     reward_server_port: int = 3100
+    # Offset added to the per-trial env reset seed (eval starts at 1000). Used
+    # to append *additional* non-overlapping episodes on a relaunch without
+    # redoing the ones already run: set seed_offset = #episodes_already_done.
+    seed_offset: int = 0
 
 @draccus.wrap()
 def eval_simpler(cfg: GenerateConfig) -> None:
@@ -169,15 +173,18 @@ def eval_simpler(cfg: GenerateConfig) -> None:
 
         # Get default SIMPLER envs
         if cfg.initial_states_type == "eval":
-            seeds = itertools.count(1000)
+            seeds = itertools.count(1000 + cfg.seed_offset)
         elif cfg.initial_states_type == "train":
-            seeds = itertools.count(0)
+            seeds = itertools.count(0 + cfg.seed_offset)
         else:
             raise ValueError("Unsupported initial states type")
 
         # Initialize LIBERO environment and task description
         env = get_simpler_env(task, cfg.model_family)
-        task_description = env.get_language_instruction()
+        # gym.make wraps the env (TimeLimit/OrderEnforcing). gymnasium >=1.0
+        # dropped automatic wrapper attribute forwarding, so reach the base env
+        # for the SIMPLER-specific accessor. Safe on gymnasium 0.29 too.
+        task_description = env.unwrapped.get_language_instruction()
 
         # Start episodes
         task_episodes, task_successes = 0, 0

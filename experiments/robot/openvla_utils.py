@@ -12,7 +12,11 @@ from PIL import Image
 from transformers import AutoProcessor
 import imageio
 
-from prismatic.models.load import load_vla
+# NOTE: `prismatic.models.load` is imported lazily inside `get_prismatic_vla`
+# (the only caller) because it pulls in transformers>=4.34 symbols
+# (MistralForCausalLM). The OpenVLA eval path loads no model locally (policy is
+# sglang-served), so deferring this import lets the eval run under the verifier's
+# transformers 4.31 env for the in-process verifier path.
 
 import requests
 import json_numpy as json
@@ -48,13 +52,65 @@ def get_unique_actions(output_ids, action):
     
     return output_ids[indices], action[indices]
 
+_INPROCESS_VERIFIER = None
+
+
+def _get_inprocess_verifier():
+    """Lazily build (and cache) the in-process RoboMonkey verifier client.
+
+    Loads the same `RobotRewardModel` the HTTP `infer_server.py` serves, but
+    inside this process so all K candidates are scored in one batched GPU
+    forward (no HTTP, no disk image hop). Honors `MONKEY_VERIFIER_SRC` to
+    locate `verifier_client.py`, else falls back to the in-repo path.
+    """
+    global _INPROCESS_VERIFIER
+    if _INPROCESS_VERIFIER is None:
+        src = os.environ.get(
+            "MONKEY_VERIFIER_SRC",
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "monkey-verifier", "src"),
+        )
+        src = os.path.abspath(src)
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from verifier_client import VerifierClient
+
+        print(f"[openvla_utils] Loading in-process verifier from {src} ...")
+        _INPROCESS_VERIFIER = VerifierClient.from_port(0)
+        _INPROCESS_VERIFIER.health_check()
+        print("[openvla_utils] In-process verifier ready.")
+    return _INPROCESS_VERIFIER
+
+
 def get_rewards(instruction, image_path, actions, cfg):
+    # In-process verifier path: when reward_server_port <= 0, score all K
+    # candidates directly via the cached RobotRewardModel (one batched GPU
+    # forward) instead of POSTing to the HTTP infer_server. Returns the same
+    # list-of-float rewards as the HTTP path below.
+    if getattr(cfg, "reward_server_port", 0) <= 0:
+        client = _get_inprocess_verifier()
+        acts = np.asarray(actions)
+        # Chunk the candidate set with the same REWARD_BATCH_SIZE knob the HTTP
+        # path uses (RoboMonkey default 2), so the in-process verifier batches
+        # like RoboMonkey and stays within GPU memory on large BoN sweeps
+        # (N up to 1024). Scoring is per-candidate independent, so the chunk
+        # size does not change the result.
+        chunk = int(os.environ.get("REWARD_BATCH_SIZE", "2"))
+        if chunk <= 0 or len(acts) <= chunk:
+            return list(client.score_candidates(instruction, image_path, acts))
+        rewards = []
+        for i in range(0, len(acts), chunk):
+            rewards.extend(client.score_candidates(instruction, image_path, acts[i:i + chunk]))
+        return rewards
+
     # Initialize rewards list
     all_rewards = []
-    
-    # Get action rewards in batches of 2, so the reward model fits in a RTX4090 with 24GB memory size
-    # Change the `batch_size` accordingly if you are using a different GPU
-    batch_size = 2
+
+    # Get action rewards in batches. The upstream default of 2 fit a 24GB
+    # RTX4090; on larger GPUs raise REWARD_BATCH_SIZE to cut HTTP round-trips
+    # (rewards are scored per-action independently, so the batch size does not
+    # change the result -- only throughput). On an H200 one batch covers all
+    # candidates.
+    batch_size = int(os.environ.get("REWARD_BATCH_SIZE", "2"))
     num_batches = math.ceil(len(actions) / batch_size)
     
     for i in range(num_batches):
@@ -184,6 +240,7 @@ def get_prismatic_vla(cfg):
     hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
     # set_seed(cfg.seed)
     # Load VLA checkpoint.
+    from prismatic.models.load import load_vla  # lazy: see note at top of file
     print(f"Loading VLM from checkpoint: {cfg.pretrained_checkpoint}")
     vla = load_vla(
         cfg.pretrained_checkpoint,
